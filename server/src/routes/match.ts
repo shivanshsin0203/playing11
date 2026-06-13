@@ -58,8 +58,9 @@ async function safeJson(c: Context): Promise<unknown> {
 function isNonNegativeInt(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v) && v >= 0;
 }
-function isPositiveNumber(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v) && v > 0;
+/** Bid amounts MUST be positive integers in raw euros — fractional euros are rejected. */
+function isPositiveInt(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v > 0;
 }
 
 // ─────────────────────────── POST /api/match ───────────────────────────
@@ -120,9 +121,9 @@ matchRoutes.post("/:id/bid", async (c) => {
   const id = c.req.param("id");
   const body = (await safeJson(c)) as { lotIndex?: unknown; amount?: unknown } | null;
 
-  if (!body || !isNonNegativeInt(body.lotIndex) || !isPositiveNumber(body.amount)) {
+  if (!body || !isNonNegativeInt(body.lotIndex) || !isPositiveInt(body.amount)) {
     return c.json(
-      { error: "body must be { lotIndex: int, amount: number > 0 }" },
+      { error: "body must be { lotIndex: int, amount: positive integer in raw euros }" },
       400
     );
   }
@@ -186,10 +187,29 @@ matchRoutes.post("/:id/ai-fire", async (c) => {
 
 // ─────────────────────────── GET /api/match/:id/debug ───────────────────────────
 // TEST / DIAGNOSTIC ONLY. Exposes the AI's full bought list — which is normally
-// hidden during the auction (spec §4). Remove or auth-gate before production.
+// hidden during the auction (spec §4). Gated by DEBUG_KEY env var: required as
+// X-Debug-Key header (or ?debug_key=... query param). If DEBUG_KEY is unset,
+// the endpoint is fully disabled in any non-dev environment.
 
 matchRoutes.get("/:id/debug", async (c) => {
   const id = c.req.param("id");
+
+  const configured = process.env.DEBUG_KEY?.trim();
+  const isDev =
+    process.env.NODE_ENV !== "production" &&
+    process.env.NODE_ENV !== "prod";
+
+  if (!configured && !isDev) {
+    return c.json({ error: "debug endpoint disabled" }, 404);
+  }
+  if (configured) {
+    const provided =
+      c.req.header("x-debug-key") ?? c.req.query("debug_key") ?? "";
+    if (provided !== configured) {
+      return c.json({ error: "debug endpoint forbidden" }, 403);
+    }
+  }
+
   return withLock(id, () => {
     const m = getMatch(id);
     if (!m) return c.json({ error: "match not found" }, 404);

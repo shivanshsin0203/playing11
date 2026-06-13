@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import type { Category, LotStateDTO, MatchStateDTO, BidEntry } from "@/lib/types";
+import type { Category, LotStateDTO, MatchStateDTO } from "@/lib/types";
 import { fmtCountdown, fmtMoney } from "@/lib/format";
 
 const BACKEND_URL =
@@ -49,6 +49,8 @@ const tokens = `
     --floodlight-soft: rgba(255, 182, 39, 0.12);
     --whistle: #E63946;
     --whistle-soft: rgba(230, 57, 70, 0.16);
+    --keeper-blue: #6FB1FF;
+    --keeper-blue-soft: rgba(111, 177, 255, 0.12);
     --text: #EFEFEF;
     --muted: #9099A8;
     --dim: #5C6573;
@@ -207,10 +209,13 @@ const tokens = `
     .sw-grid { grid-template-columns: 1fr; height: auto; }
   }
   .sw-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; }
-  .sw-scroll { overflow-y: auto; min-height: 0; }
-  .sw-scroll::-webkit-scrollbar { width: 5px; }
-  .sw-scroll::-webkit-scrollbar-track { background: transparent; }
-  .sw-scroll::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 2.5px; }
+  .sw-scroll {
+    overflow-y: auto;
+    min-height: 0;
+    scrollbar-width: none;       /* Firefox */
+    -ms-overflow-style: none;    /* old Edge / IE */
+  }
+  .sw-scroll::-webkit-scrollbar { width: 0; height: 0; display: none; }  /* WebKit */
 
   /* hairline frame — corner ticks, broadcast lower-third feel */
   .sw-tick-tl, .sw-tick-tr, .sw-tick-bl, .sw-tick-br {
@@ -434,7 +439,7 @@ export default function AuctionRoom({ matchId }: { matchId: string }) {
       <TopBar matchId={matchId} lotIndex={lot.lotIndex} lotsTotal={state.lotsTotal} lotsDone={state.lotsDone} />
 
       <div className="sw-grid">
-        {/* LEFT — Dressing Room */}
+        {/* LEFT — Treasury + Ledger + Chemistry */}
         <div className="sw-col">
           <Treasury
             youBudget={state.user.budget}
@@ -443,7 +448,12 @@ export default function AuctionRoom({ matchId }: { matchId: string }) {
             aiBought={state.ai.boughtCount}
             totalSlots={BUCKETS.reduce((s, b) => s + b.target, 0)}
           />
-          <DressingRoom bought={state.user.bought} counts={userCounts} />
+          <Ledger
+            bought={state.user.bought}
+            budget={state.user.budget}
+            totalSlots={BUCKETS.reduce((s, b) => s + b.target, 0)}
+          />
+          <Chemistry bought={state.user.bought} />
         </div>
 
         {/* CENTRE — The Floor */}
@@ -459,13 +469,90 @@ export default function AuctionRoom({ matchId }: { matchId: string }) {
           />
         </div>
 
-        {/* RIGHT — The Ticker */}
+        {/* RIGHT — Highest bid + Dressing Room */}
         <div className="sw-col">
-          <HighestBidBoard lot={lot} />
-          <Ticker lot={lot} lastResult={lastResult} lowTime={lowTime} />
+          <HighestBidBoard lot={lot} lastResult={lastResult} />
+          <DressingRoom bought={state.user.bought} counts={userCounts} />
         </div>
       </div>
     </div>
+  );
+}
+
+// ─────────────────────── PlayerPhoto — fallback-safe ───────────────────────
+// Some entries in the player pool have photo_path="/players/placeholder.webp",
+// which doesn't ship. The old onError handler dimmed the broken image (the bug
+// you saw mid-to-late game). This component detects the known placeholder path
+// up front AND falls back on any 404, rendering the player's initials on the
+// same chalk pedestal — never a dim broken image.
+
+function PlayerPhoto({
+  src,
+  name,
+  size,
+  rounded = 8,
+  pedestal,
+  boxShadow,
+}: {
+  src: string;
+  name: string;
+  size: number;
+  rounded?: number;
+  pedestal: string;
+  boxShadow?: string;
+}) {
+  const knownMissing = !src || src.includes("placeholder");
+  const [failed, setFailed] = useState(knownMissing);
+
+  const initials =
+    name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(-2)
+      .map((w) => w[0] ?? "")
+      .join("")
+      .toUpperCase()
+      .slice(0, 2) || "?";
+
+  const shared: React.CSSProperties = {
+    width: size,
+    height: size,
+    borderRadius: rounded,
+    background: pedestal,
+    boxShadow,
+    flex: "0 0 auto",
+  };
+
+  if (failed) {
+    return (
+      <div
+        style={{
+          ...shared,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: "var(--font-display)",
+          fontWeight: 800,
+          fontSize: Math.max(10, Math.round(size * 0.42)),
+          letterSpacing: "0.04em",
+          color: "#3F3A2E",
+        }}
+      >
+        {initials}
+      </div>
+    );
+  }
+
+  return (
+    /* eslint-disable-next-line @next/next/no-img-element */
+    <img
+      src={src}
+      alt={name}
+      width={size}
+      height={size}
+      style={{ ...shared, objectFit: "cover" }}
+      onError={() => setFailed(true)}
+    />
   );
 }
 
@@ -634,73 +721,251 @@ function DressingRoom({
   bought,
   counts,
 }: {
-  bought: Array<{ player: { name: string; category: Category } }>;
+  bought: Array<{
+    player: { name: string; category: Category; primary_position: string; overall: number; photo_path: string };
+    price: number;
+  }>;
   counts: Record<Category, number>;
 }) {
+  const catAccent: Record<Category, string> = {
+    ATT: "var(--whistle)",
+    MID: "var(--floodlight)",
+    DEF: "var(--keeper-blue)",
+    GK: "var(--chalk)",
+  };
+
   return (
     <div className="sw-card" style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <span className="sw-tick-tl" /><span className="sw-tick-tr" />
       <span className="sw-tick-bl" /><span className="sw-tick-br" />
       <div className="sw-corner-mark">FORMATION · 4-3-3</div>
       <div className="sw-eyebrow" style={{ marginBottom: 10 }}>Dressing Room</div>
-      <div className="sw-scroll" style={{ flex: 1, display: "flex", flexDirection: "column", gap: 11 }}>
+
+      <div className="sw-scroll" style={{ flex: 1, display: "flex", flexDirection: "column", gap: 14 }}>
         {BUCKETS.map((b) => {
           const count = counts[b.key] ?? 0;
-          const color = bucketFillColor(count, b.target);
-          const pct = Math.min(100, (count / b.target) * 100);
+          const fillColor = bucketFillColor(count, b.target);
           const players = bought.filter((bp) => bp.player.category === b.key);
+          const open = Math.max(0, b.target - count);
+          const accent = catAccent[b.key];
+
           return (
             <div key={b.key}>
+              {/* section header */}
               <div
                 style={{
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "baseline",
-                  marginBottom: 5,
+                  marginBottom: 6,
                 }}
               >
-                <span
-                  className="sw-display"
-                  style={{ fontWeight: 700, fontSize: 14, letterSpacing: "0.04em", color: "var(--text)" }}
-                >
-                  {b.label.toUpperCase()}
-                </span>
-                <span className="sw-mono" style={{ color, fontWeight: 700, fontSize: 13 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span
+                    style={{
+                      width: 3,
+                      height: 12,
+                      background: accent,
+                      borderRadius: 1.5,
+                    }}
+                  />
+                  <span
+                    className="sw-display"
+                    style={{
+                      fontWeight: 800,
+                      fontSize: 13,
+                      letterSpacing: "0.16em",
+                      color: "var(--text)",
+                    }}
+                  >
+                    {b.label.toUpperCase()}
+                  </span>
+                </div>
+                <span className="sw-mono" style={{ color: fillColor, fontWeight: 700, fontSize: 12 }}>
                   {count}
                   <span style={{ color: "var(--dim)", fontWeight: 500 }}>/{b.target}</span>
                 </span>
               </div>
-              {/* pip row — encodes formation positions */}
-              <div style={{ display: "flex", gap: 3, marginBottom: 6 }}>
+
+              {/* pip row */}
+              <div style={{ display: "flex", gap: 3, marginBottom: 8 }}>
                 {Array.from({ length: b.target }).map((_, i) => (
                   <div
                     key={i}
                     style={{
                       flex: 1,
-                      height: 4,
+                      height: 3,
                       borderRadius: 1,
-                      background: i < count ? color : "var(--surface-3)",
+                      background: i < count ? fillColor : "var(--surface-3)",
                       transition: "background 0.3s ease",
                     }}
                   />
                 ))}
               </div>
-              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                {players.length === 0 ? (
-                  <span style={{ fontSize: 11, color: "var(--dim)", fontStyle: "italic" }}>—</span>
-                ) : (
-                  players.map((bp, idx) => (
-                    <span key={idx} className="sw-chip" style={{ color: "var(--text)", fontSize: 10 }}>
-                      {bp.player.name}
-                    </span>
-                  ))
-                )}
+
+              {/* card grid */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(110px, 1fr))",
+                  gap: 6,
+                }}
+              >
+                {players.map((bp, idx) => (
+                  <SignedCard key={idx} bp={bp} accent={accent} />
+                ))}
+                {Array.from({ length: open }).map((_, i) => (
+                  <OpenSlotCard key={`open-${i}`} />
+                ))}
               </div>
-              <div style={{ marginTop: 10, height: 1, background: "var(--hairline)" }} />
             </div>
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function SignedCard({
+  bp,
+  accent,
+}: {
+  bp: {
+    player: { name: string; primary_position: string; overall: number; photo_path: string };
+    price: number;
+  };
+  accent: string;
+}) {
+  const p = bp.player;
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        background: "var(--surface-2)",
+        border: "1px solid var(--hairline)",
+        borderRadius: 6,
+        overflow: "hidden",
+        position: "relative",
+        animation: "sw-tick-in 0.36s cubic-bezier(0.2, 0.8, 0.2, 1)",
+      }}
+    >
+      {/* left accent stripe */}
+      <div
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: 2,
+          background: accent,
+        }}
+      />
+      <div style={{ display: "flex", gap: 7, padding: "6px 7px 6px 9px", alignItems: "center" }}>
+        <PlayerPhoto
+          src={p.photo_path}
+          name={p.name}
+          size={32}
+          rounded={4}
+          pedestal="linear-gradient(160deg, var(--chalk) 0%, #DCD7C8 100%)"
+          boxShadow="inset 0 0 0 1px rgba(0,0,0,0.20)"
+        />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div
+            className="sw-display"
+            style={{
+              fontWeight: 700,
+              fontSize: 11,
+              letterSpacing: "0.02em",
+              color: "var(--text)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              lineHeight: 1.1,
+            }}
+          >
+            {p.name}
+          </div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              marginTop: 1,
+            }}
+          >
+            <span
+              className="sw-display"
+              style={{
+                fontSize: 9,
+                fontWeight: 700,
+                letterSpacing: "0.10em",
+                color: accent,
+              }}
+            >
+              {p.primary_position}
+            </span>
+            <span style={{ color: "var(--dim)", fontSize: 9 }}>·</span>
+            <span
+              className="sw-mono"
+              style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)" }}
+            >
+              {p.overall}
+            </span>
+          </div>
+        </div>
+      </div>
+      <div
+        className="sw-mono"
+        style={{
+          padding: "3px 8px 5px 11px",
+          fontSize: 11,
+          fontWeight: 600,
+          color: "var(--chalk)",
+          borderTop: "1px solid var(--hairline)",
+          background: "var(--ink)",
+          letterSpacing: "-0.01em",
+        }}
+      >
+        {fmtMoney(bp.price)}
+      </div>
+    </div>
+  );
+}
+
+function OpenSlotCard() {
+  return (
+    <div
+      style={{
+        minHeight: 64,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 2,
+        background: "transparent",
+        border: "1px dashed var(--hairline-strong)",
+        borderRadius: 6,
+        padding: "10px 6px",
+      }}
+    >
+      <span
+        className="sw-display"
+        style={{
+          fontSize: 9,
+          fontWeight: 700,
+          letterSpacing: "0.20em",
+          color: "var(--dim)",
+        }}
+      >
+        OPEN
+      </span>
+      <span
+        className="sw-mono"
+        style={{ fontSize: 9, color: "var(--dim)" }}
+      >
+        slot
+      </span>
     </div>
   );
 }
@@ -850,8 +1115,20 @@ function DossierAndConsole({
   const catTint: Record<Category, string> = {
     ATT: "rgba(230, 57, 70, 0.10)",
     MID: "rgba(255, 182, 39, 0.10)",
-    DEF: "rgba(106, 153, 255, 0.10)",
+    DEF: "rgba(111, 177, 255, 0.10)",
     GK: "rgba(242, 237, 224, 0.08)",
+  };
+  const catAccent: Record<Category, string> = {
+    ATT: "var(--whistle)",
+    MID: "var(--floodlight)",
+    DEF: "var(--keeper-blue)",
+    GK: "var(--chalk)",
+  };
+  const catAccentSoft: Record<Category, string> = {
+    ATT: "var(--whistle-soft)",
+    MID: "var(--floodlight-soft)",
+    DEF: "var(--keeper-blue-soft)",
+    GK: "var(--chalk-soft)",
   };
 
   const stats = positionStats[p.category];
@@ -888,22 +1165,13 @@ function DossierAndConsole({
         </div>
 
         <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
+          <PlayerPhoto
             src={p.photo_path}
-            alt={p.name}
-            width={84}
-            height={84}
-            style={{
-              borderRadius: 6,
-              background: "var(--surface-3)",
-              objectFit: "cover",
-              border: "1px solid var(--hairline-strong)",
-              flex: "0 0 auto",
-            }}
-            onError={(e) => {
-              (e.currentTarget as HTMLImageElement).style.opacity = "0.3";
-            }}
+            name={p.name}
+            size={84}
+            rounded={8}
+            pedestal="radial-gradient(circle at 50% 35%, #FFFFFF 0%, var(--chalk) 45%, #DCD7C8 100%)"
+            boxShadow="0 6px 18px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 0, 0, 0.25), inset 0 0 0 1px rgba(255, 255, 255, 0.4)"
           />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div
@@ -921,11 +1189,51 @@ function DossierAndConsole({
             >
               {p.name.toUpperCase()}
             </div>
-            <div style={{ display: "flex", gap: 10, marginTop: 6, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
-              <span className="sw-chip" style={{ color: "var(--text)" }}>{p.primary_position}</span>
-              <span style={{ color: "var(--muted)" }}>{p.club}</span>
-              <span style={{ color: "var(--dim)" }}>·</span>
-              <span style={{ color: "var(--muted)" }}>{p.country}</span>
+            <div style={{ display: "flex", gap: 10, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
+              {/* PRIMARY POSITION — bigger, filled, in category accent */}
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  fontFamily: "var(--font-display)",
+                  fontWeight: 800,
+                  fontSize: 14,
+                  letterSpacing: "0.16em",
+                  padding: "5px 10px",
+                  borderRadius: 5,
+                  background: catAccentSoft[p.category],
+                  color: catAccent[p.category],
+                  border: `1px solid ${catAccent[p.category]}`,
+                }}
+              >
+                {p.primary_position}
+              </span>
+              {/* CLUB + COUNTRY — display type, chalk, weighted differently to read at a glance */}
+              <span
+                className="sw-display"
+                style={{
+                  fontWeight: 700,
+                  fontSize: 15,
+                  color: "var(--chalk)",
+                  letterSpacing: "0.02em",
+                }}
+              >
+                {p.club}
+              </span>
+              <span style={{ color: "var(--dim)", fontSize: 14 }}>·</span>
+              <span
+                className="sw-display"
+                style={{
+                  fontWeight: 600,
+                  fontSize: 14,
+                  color: "var(--chalk)",
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  opacity: 0.85,
+                }}
+              >
+                {p.country}
+              </span>
             </div>
           </div>
           <div style={{ textAlign: "right", flex: "0 0 auto" }}>
@@ -987,22 +1295,22 @@ function DossierAndConsole({
         })}
       </div>
 
-      {/* ALSO PLAYS — alt positions strip */}
+      {/* ALSO PLAYS — outlined ghost chips, intentionally quieter than the primary position */}
       <div
         style={{
-          padding: "10px 16px",
+          padding: "8px 16px 10px",
           display: "flex",
           alignItems: "center",
-          gap: 10,
+          gap: 8,
           flexWrap: "wrap",
           borderBottom: "1px solid var(--hairline)",
         }}
       >
-        <span className="sw-eyebrow">Also plays</span>
+        <span className="sw-eyebrow sw-eyebrow-dim">Also plays</span>
         {altPositions.length === 0 ? (
           <span
             className="sw-mono"
-            style={{ fontSize: 11, color: "var(--dim)", fontStyle: "italic" }}
+            style={{ fontSize: 10, color: "var(--dim)", fontStyle: "italic" }}
           >
             specialist · {p.primary_position} only
           </span>
@@ -1010,11 +1318,18 @@ function DossierAndConsole({
           altPositions.map((pos) => (
             <span
               key={pos}
-              className="sw-chip"
               style={{
-                color: "var(--chalk)",
-                borderColor: "var(--chalk-soft)",
-                background: "var(--chalk-soft)",
+                display: "inline-flex",
+                alignItems: "center",
+                fontFamily: "var(--font-display)",
+                fontWeight: 600,
+                fontSize: 10,
+                letterSpacing: "0.14em",
+                padding: "2px 7px",
+                borderRadius: 3,
+                color: "var(--muted)",
+                border: "1px dashed var(--hairline-strong)",
+                background: "transparent",
               }}
             >
               {pos}
@@ -1025,44 +1340,8 @@ function DossierAndConsole({
 
       {/* bid console */}
       <div style={{ padding: "12px 16px 14px", marginTop: "auto" }}>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            paddingBottom: 10,
-            borderBottom: "1px solid var(--hairline)",
-            marginBottom: 10,
-          }}
-        >
-          <div>
-            <div className="sw-eyebrow">Current bid · held by</div>
-            <div
-              className="sw-display"
-              style={{
-                fontSize: 14,
-                fontWeight: 700,
-                marginTop: 2,
-                letterSpacing: "0.10em",
-                textTransform: "uppercase",
-                color:
-                  lot.highBidder === "user"
-                    ? "var(--chalk)"
-                    : lot.highBidder === "ai"
-                      ? "var(--floodlight)"
-                      : "var(--dim)",
-              }}
-            >
-              {lot.highBidder ?? "nobody yet"}
-            </div>
-          </div>
-          <div
-            className="sw-mono"
-            style={{ fontSize: 30, fontWeight: 700, color: "var(--text)", lineHeight: 1 }}
-          >
-            {fmtMoney(lot.currentBid)}
-          </div>
-        </div>
+        {/* BID-HOLDER BANNER — impossible-to-miss who holds the current bid */}
+        <BidHolderBanner highBidder={lot.highBidder} currentBid={lot.currentBid} />
 
         {/* quick increments */}
         <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
@@ -1186,26 +1465,176 @@ function DossierAndConsole({
   );
 }
 
+// ─────────────────────── BidHolderBanner — distinctive three-state ───────────────────────
+
+function BidHolderBanner({
+  highBidder,
+  currentBid,
+}: {
+  highBidder: "user" | "ai" | null;
+  currentBid: number;
+}) {
+  if (highBidder === null) {
+    // STATE 1 — no bids yet · dashed neutral
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "10px 14px",
+          marginBottom: 10,
+          background: "var(--surface-2)",
+          border: "1.5px dashed var(--hairline-strong)",
+          borderRadius: 6,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: 50,
+              background: "transparent",
+              border: "1.5px dashed var(--muted)",
+            }}
+          />
+          <span
+            className="sw-display"
+            style={{
+              fontWeight: 700,
+              fontSize: 13,
+              letterSpacing: "0.18em",
+              textTransform: "uppercase",
+              color: "var(--muted)",
+            }}
+          >
+            No bids yet · opening
+          </span>
+        </div>
+        <span
+          className="sw-mono"
+          style={{ fontSize: 20, fontWeight: 700, color: "var(--muted)" }}
+        >
+          {fmtMoney(currentBid)}
+        </span>
+      </div>
+    );
+  }
+
+  const isUser = highBidder === "user";
+  const bg = isUser ? "var(--chalk)" : "var(--floodlight)";
+  const label = isUser ? "You lead" : "AI leading";
+  const stripeColor = isUser ? "#9F9A8C" : "#A3741A";
+
+  // STATE 2 / 3 — chalk or floodlight, ink text, weighty fill
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "stretch",
+        marginBottom: 10,
+        background: bg,
+        borderRadius: 6,
+        overflow: "hidden",
+        boxShadow: `0 6px 18px ${isUser ? "rgba(242, 237, 224, 0.16)" : "rgba(255, 182, 39, 0.18)"}`,
+        animation: "sw-tick-in 0.32s cubic-bezier(0.2, 0.8, 0.2, 1)",
+      }}
+      key={`${highBidder}-${currentBid}`}
+    >
+      <div style={{ width: 6, background: stripeColor, flex: "0 0 auto" }} />
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "10px 14px",
+          color: "var(--ink)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span
+            style={{
+              width: 9,
+              height: 9,
+              borderRadius: 50,
+              background: "var(--ink)",
+              boxShadow: "0 0 0 2px rgba(0,0,0,0.15)",
+            }}
+          />
+          <span
+            className="sw-display"
+            style={{
+              fontWeight: 800,
+              fontSize: 15,
+              letterSpacing: "0.22em",
+              textTransform: "uppercase",
+              color: "var(--ink)",
+            }}
+          >
+            {label}
+          </span>
+        </div>
+        <span
+          className="sw-mono"
+          style={{
+            fontSize: 22,
+            fontWeight: 700,
+            color: "var(--ink)",
+            letterSpacing: "-0.01em",
+          }}
+        >
+          {fmtMoney(currentBid)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // ─────────────────────── HighestBidBoard (right column top) ───────────────────────
 
-function HighestBidBoard({ lot }: { lot: LotStateDTO }) {
+function HighestBidBoard({
+  lot,
+  lastResult,
+}: {
+  lot: LotStateDTO;
+  lastResult: LotEndResp["lotResult"] | null;
+}) {
   const high = lot.highBidder;
-  const accent = high === "user" ? "var(--chalk)" : high === "ai" ? "var(--floodlight)" : "var(--muted)";
   const bidCount = lot.bidLog.length;
   const opening = bidCount === 0;
+  // overlay the gavel banner only between lots (new lot just opened, no bids yet)
+  const showGavel = lastResult && opening;
+
+  // three matched states
+  const state =
+    high === "user" ? "you" : high === "ai" ? "ai" : "none";
+  const accent =
+    state === "you" ? "var(--chalk)" : state === "ai" ? "var(--floodlight)" : "var(--muted)";
+  const tint =
+    state === "you"
+      ? "rgba(242, 237, 224, 0.06)"
+      : state === "ai"
+        ? "rgba(255, 182, 39, 0.08)"
+        : "transparent";
+  const stateLabel =
+    state === "you" ? "YOU LEAD" : state === "ai" ? "AI LEADING" : "OPENING PRICE";
+
   return (
     <div
       className="sw-card"
       style={{
-        borderColor: high ? accent : "var(--hairline)",
-        boxShadow: high ? `inset 3px 0 0 ${accent}` : "inset 3px 0 0 transparent",
-        transition: "box-shadow 0.3s ease",
+        background: `linear-gradient(180deg, ${tint} 0%, var(--surface-1) 60%)`,
+        borderColor: state === "none" ? "var(--hairline)" : accent,
+        boxShadow: state === "none" ? "none" : `inset 4px 0 0 ${accent}, 0 0 32px ${state === "you" ? "rgba(242, 237, 224, 0.05)" : "rgba(255, 182, 39, 0.07)"}`,
+        transition: "box-shadow 0.3s ease, border-color 0.3s ease, background 0.3s ease",
       }}
     >
       <span className="sw-tick-tl" /><span className="sw-tick-tr" />
       <span className="sw-tick-bl" /><span className="sw-tick-br" />
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
         <div className="sw-eyebrow">Hammer price · live</div>
         <span
           className="sw-mono"
@@ -1215,92 +1644,75 @@ function HighestBidBoard({ lot }: { lot: LotStateDTO }) {
         </span>
       </div>
 
+      {/* state label sits right above the price — the second place you confirm who's winning */}
+      <div
+        className="sw-display"
+        style={{
+          fontWeight: 800,
+          fontSize: 13,
+          letterSpacing: "0.22em",
+          color: accent,
+          marginTop: 6,
+          marginBottom: 2,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        <span
+          style={{
+            width: 7,
+            height: 7,
+            borderRadius: 50,
+            background: state === "none" ? "transparent" : accent,
+            border: state === "none" ? "1.5px dashed var(--muted)" : "none",
+            boxShadow: state === "none" ? "none" : `0 0 8px ${accent}`,
+          }}
+        />
+        {stateLabel}
+      </div>
+
       <div
         className="sw-mono"
+        key={`${state}-${lot.currentBid}`}
         style={{
           fontSize: 44,
           fontWeight: 700,
           letterSpacing: "-0.02em",
-          color: accent,
+          color: state === "none" ? "var(--text)" : accent,
           lineHeight: 0.95,
           padding: "2px 0",
+          animation: "sw-tick-in 0.32s cubic-bezier(0.2, 0.8, 0.2, 1)",
         }}
       >
         {fmtMoney(lot.currentBid)}
       </div>
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}>
-        <span style={{ fontSize: 11, color: "var(--muted)" }}>
-          {opening ? "opening price" : "held by"}{" "}
-          <span
-            className="sw-display"
-            style={{
-              color: accent,
-              fontWeight: 700,
-              letterSpacing: "0.12em",
-              textTransform: "uppercase",
-            }}
-          >
-            {high ?? "—"}
-          </span>
-        </span>
-      </div>
-    </div>
-  );
-}
-
-// ─────────────────────── Ticker (right column bottom) ───────────────────────
-
-function Ticker({
-  lot,
-  lastResult,
-  lowTime,
-}: {
-  lot: LotStateDTO;
-  lastResult: LotEndResp["lotResult"] | null;
-  lowTime: boolean;
-}) {
-  // last 5, newest first
-  const last5: BidEntry[] = lot.bidLog.slice(-5).reverse();
-  const now = Date.now();
-
-  return (
-    <div
-      className="sw-card"
-      style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
-    >
-      <span className="sw-tick-tl" /><span className="sw-tick-tr" />
-      <span className="sw-tick-bl" /><span className="sw-tick-br" />
-
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-        <div className="sw-eyebrow">Ticker · last five</div>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <span className="sw-live-dot" />
-          <span className="sw-eyebrow" style={{ color: "var(--whistle)" }}>{lowTime ? "stoppage" : "live"}</span>
+      {opening && !showGavel && (
+        <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4, fontFamily: "var(--font-mono)" }}>
+          floor set by the house · awaiting first bid
         </div>
-      </div>
+      )}
 
-      {lastResult && (
+      {showGavel && lastResult && (
         <div
           className="sw-tick"
           style={{
+            marginTop: 10,
             padding: "8px 10px",
             background: "var(--surface-2)",
             border: "1px solid var(--hairline-strong)",
-            borderLeft: "3px solid var(--chalk)",
+            borderLeft: `3px solid ${lastResult.winner === "user" ? "var(--chalk)" : lastResult.winner === "ai" ? "var(--floodlight)" : "var(--muted)"}`,
             borderRadius: 4,
-            fontSize: 12,
-            marginBottom: 10,
-            fontFamily: "var(--font-mono)",
           }}
         >
-          <span
+          <div
             className="sw-display"
             style={{
-              color: "var(--chalk)",
-              fontWeight: 700,
-              letterSpacing: "0.14em",
               fontSize: 10,
+              fontWeight: 800,
+              letterSpacing: "0.22em",
+              color: lastResult.winner === "user" ? "var(--chalk)" : lastResult.winner === "ai" ? "var(--floodlight)" : "var(--muted)",
             }}
           >
             GAVEL ·{" "}
@@ -1309,97 +1721,281 @@ function Ticker({
               : lastResult.winner === "ai"
                 ? "AI TOOK IT"
                 : "PASSED"}
-          </span>
-          <div style={{ color: "var(--muted)", marginTop: 2 }}>
+          </div>
+          <div className="sw-mono" style={{ color: "var(--muted)", marginTop: 2, fontSize: 11 }}>
             {fmtMoney(lastResult.price)}
             {lastResult.reconShotFired ? " · recon shot" : ""}
           </div>
         </div>
       )}
+    </div>
+  );
+}
 
-      <div className="sw-scroll" style={{ flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
-        {last5.length === 0 ? (
-          <div
+// ─────────────────────── Ledger (left column) ───────────────────────
+
+function Ledger({
+  bought,
+  budget,
+  totalSlots,
+}: {
+  bought: Array<{ player: { name: string }; price: number }>;
+  budget: number;
+  totalSlots: number;
+}) {
+  const spent = bought.reduce((s, b) => s + b.price, 0);
+  const count = bought.length;
+  const avg = count > 0 ? Math.floor(spent / count) : 0;
+  const highest =
+    bought.length > 0
+      ? bought.reduce((max, b) => (b.price > max.price ? b : max))
+      : null;
+  const remainingSlots = Math.max(0, totalSlots - count);
+  const proj = remainingSlots > 0 ? Math.floor(budget / remainingSlots) : 0;
+
+  return (
+    <div className="sw-card">
+      <span className="sw-tick-tl" /><span className="sw-tick-tr" />
+      <span className="sw-tick-bl" /><span className="sw-tick-br" />
+      <div className="sw-corner-mark">PAGE 2 · YOU</div>
+      <div className="sw-eyebrow" style={{ marginBottom: 10 }}>Ledger · treasury detail</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <LedgerRow label="Spent" value={fmtMoney(spent)} accent="var(--chalk)" />
+        <LedgerRow
+          label="Avg per signing"
+          value={count > 0 ? fmtMoney(avg) : "—"}
+          accent="var(--text)"
+        />
+        <LedgerRow
+          label="Highest bid"
+          value={highest ? fmtMoney(highest.price) : "—"}
+          aux={highest ? highest.player.name : undefined}
+          accent="var(--text)"
+        />
+        <LedgerRow
+          label="Per slot left"
+          value={remainingSlots > 0 ? fmtMoney(proj) : "—"}
+          aux={remainingSlots > 0 ? `${remainingSlots} slots open` : "squad full"}
+          accent="var(--chalk)"
+        />
+      </div>
+    </div>
+  );
+}
+
+function LedgerRow({
+  label,
+  value,
+  aux,
+  accent,
+}: {
+  label: string;
+  value: string;
+  aux?: string;
+  accent: string;
+}) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+      <span
+        className="sw-display"
+        style={{
+          fontSize: 10,
+          fontWeight: 600,
+          letterSpacing: "0.16em",
+          color: "var(--muted)",
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </span>
+      <span style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", minWidth: 0 }}>
+        <span
+          className="sw-mono"
+          style={{ fontSize: 13, fontWeight: 700, color: accent, lineHeight: 1.1 }}
+        >
+          {value}
+        </span>
+        {aux && (
+          <span
             style={{
-              padding: "30px 10px",
-              textAlign: "center",
+              fontSize: 10,
               color: "var(--dim)",
-              fontSize: 11,
-              fontStyle: "italic",
               fontFamily: "var(--font-mono)",
+              maxWidth: 140,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
             }}
           >
-            waiting for the first bid…
+            {aux}
+          </span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+// ─────────────────────── Chemistry (left column bottom) ───────────────────────
+
+function Chemistry({
+  bought,
+}: {
+  bought: Array<{ player: { name: string; country: string; club: string } }>;
+}) {
+  const countries = new Map<string, string[]>();
+  const clubs = new Map<string, string[]>();
+  for (const bp of bought) {
+    const c = bp.player.country;
+    if (!countries.has(c)) countries.set(c, []);
+    countries.get(c)!.push(bp.player.name);
+    const k = bp.player.club;
+    if (!clubs.has(k)) clubs.set(k, []);
+    clubs.get(k)!.push(bp.player.name);
+  }
+  const countryClusters = [...countries.entries()]
+    .filter(([, n]) => n.length >= 2)
+    .sort((a, b) => b[1].length - a[1].length);
+  const clubClusters = [...clubs.entries()]
+    .filter(([, n]) => n.length >= 2)
+    .sort((a, b) => b[1].length - a[1].length);
+  const totalLinks = [...countryClusters, ...clubClusters].reduce(
+    (s, [, n]) => s + (n.length * (n.length - 1)) / 2,
+    0
+  );
+  const empty = countryClusters.length === 0 && clubClusters.length === 0;
+
+  return (
+    <div className="sw-card" style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+      <span className="sw-tick-tl" /><span className="sw-tick-tr" />
+      <span className="sw-tick-bl" /><span className="sw-tick-br" />
+      <div
+        style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}
+      >
+        <div className="sw-eyebrow">Chemistry · brewing</div>
+        <span
+          className="sw-mono"
+          style={{ fontSize: 10, color: "var(--dim)", letterSpacing: "0.06em" }}
+        >
+          {totalLinks} {totalLinks === 1 ? "link" : "links"}
+        </span>
+      </div>
+
+      <div className="sw-scroll" style={{ flex: 1, display: "flex", flexDirection: "column", gap: 12 }}>
+        {empty ? (
+          <div
+            style={{
+              padding: "14px 4px",
+              fontSize: 11,
+              color: "var(--dim)",
+              fontFamily: "var(--font-mono)",
+              fontStyle: "italic",
+              lineHeight: 1.5,
+            }}
+          >
+            no links forming yet · sign players from a shared nation or club to build chemistry
           </div>
         ) : (
-          last5.map((b, i) => {
-            const isUser = b.by === "user";
-            const accent = isUser ? "var(--chalk)" : "var(--floodlight)";
-            const ago = Math.max(0, Math.round((now - b.t) / 1000));
-            const opacity = 1 - i * 0.14;
-            return (
+          <>
+            {countryClusters.length > 0 && (
+              <ClusterGroup label="By country" entries={countryClusters} accent="var(--chalk)" />
+            )}
+            {clubClusters.length > 0 && (
+              <ClusterGroup label="By club" entries={clubClusters} accent="var(--floodlight)" />
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ClusterGroup({
+  label,
+  entries,
+  accent,
+}: {
+  label: string;
+  entries: Array<[string, string[]]>;
+  accent: string;
+}) {
+  return (
+    <div>
+      <div className="sw-eyebrow sw-eyebrow-dim" style={{ marginBottom: 6 }}>{label}</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        {entries.map(([name, players]) => {
+          const links = (players.length * (players.length - 1)) / 2;
+          return (
+            <div
+              key={name}
+              style={{
+                padding: "7px 9px",
+                background: "var(--surface-2)",
+                border: "1px solid var(--hairline)",
+                borderLeft: `2px solid ${accent}`,
+                borderRadius: 4,
+                animation: "sw-tick-in 0.36s cubic-bezier(0.2, 0.8, 0.2, 1)",
+              }}
+            >
               <div
-                key={`${b.t}-${b.by}-${i}`}
-                className="sw-tick"
                 style={{
                   display: "flex",
-                  alignItems: "stretch",
-                  gap: 0,
-                  padding: 0,
-                  background: i === 0 ? "var(--surface-2)" : "transparent",
-                  border: `1px solid ${i === 0 ? "var(--hairline-strong)" : "var(--hairline)"}`,
-                  borderRadius: 6,
-                  opacity,
-                  overflow: "hidden",
+                  justifyContent: "space-between",
+                  alignItems: "baseline",
+                  marginBottom: 3,
+                  gap: 8,
                 }}
               >
-                <div style={{ width: 3, background: accent, flex: "0 0 auto" }} />
-                <div
+                <span
+                  className="sw-display"
                   style={{
-                    flex: 1,
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 10,
-                    padding: "8px 10px",
-                    minWidth: 0,
+                    fontSize: 12,
+                    fontWeight: 700,
+                    letterSpacing: "0.10em",
+                    color: "var(--text)",
+                    textTransform: "uppercase",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
                   }}
                 >
-                  <div
-                    className="sw-display"
+                  {name}
+                </span>
+                <span style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
+                  <span
+                    className="sw-mono"
+                    style={{ fontSize: 11, color: accent, fontWeight: 700 }}
+                  >
+                    ×{players.length}
+                  </span>
+                  <span
                     style={{
-                      fontWeight: 700,
-                      fontSize: 10,
-                      letterSpacing: "0.18em",
-                      color: accent,
-                      width: 26,
-                      flex: "0 0 auto",
+                      fontSize: 9,
+                      color: "var(--dim)",
+                      letterSpacing: "0.06em",
+                      fontFamily: "var(--font-mono)",
                     }}
                   >
-                    {isUser ? "YOU" : "AI"}
-                  </div>
-                  <div
-                    className="sw-mono"
-                    style={{
-                      fontWeight: 700,
-                      fontSize: 16,
-                      color: "var(--text)",
-                      flex: 1,
-                      letterSpacing: "-0.01em",
-                    }}
-                  >
-                    {fmtMoney(b.amount)}
-                  </div>
-                  <div
-                    className="sw-mono"
-                    style={{ fontSize: 10, color: "var(--dim)", whiteSpace: "nowrap" }}
-                  >
-                    {ago < 1 ? "now" : `${ago}s`}
-                  </div>
-                </div>
+                    · {links} {links === 1 ? "link" : "links"}
+                  </span>
+                </span>
               </div>
-            );
-          })
-        )}
+              <div
+                style={{
+                  fontSize: 10,
+                  color: "var(--muted)",
+                  fontFamily: "var(--font-mono)",
+                  letterSpacing: "0.01em",
+                  lineHeight: 1.4,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {players.join(" · ")}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

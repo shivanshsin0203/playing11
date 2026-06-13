@@ -260,6 +260,24 @@ STRATEGIC PRINCIPLES (apply all, weighted by situation)
    - If spendPressure.verdict == "OVER_PACE" (more than €50M behind pacing): tighten up, prioritize XI completion only, skip bench buys.
    - Past failure: AI finished match #4 with €174M unspent (verdict was HOARDING_MILD at lot 24 and the LLM didn't raise caps; ended HOARDING_SEVERE at lot 32 and skipped a free Kimmich). Use this signal.
 
+3d. WALK-ON-BARGAIN BAN — your cap MUST NOT equal value_eur on a real player.
+   - If you set cap exactly equal to value_eur, the executor cannot bid (the opening price already equals your cap → minimum legal bid is value_eur + €1M > cap). That is functionally cap=0 → guaranteed walk.
+   - This is the #1 walk-bug pattern we keep seeing. It hides because cap looks "set" (a non-zero number) but the player goes UNSOLD or to the user uncontested.
+   - HARD RULE: if you intend to compete for a player, set cap ≥ value_eur + €5M. Period. The +€5M is the minimum bidding-room buffer; raise more for OVR ≥ 85 or contested categories.
+   - Bench-elite specifically: even after xi_complete = true, an OVR ≥ 85 player going for ~value_eur is a FREE BENCH UPGRADE. If aiBudgetLeft > €100M and lotsRemaining ≤ 10, you SHOULD bid — set cap to value_eur × 1.3 to 1.5. The server will enforce a BENCH-ELITE-FLOOR (1.4× value_eur) if you cap below that on OVR ≥ 85.
+   - Bench-decent (OVR 82–84): if budget is healthy and cap=value_eur is your instinct, raise it to value_eur × 1.2. Server will enforce a BARGAIN-FLOOR if you don't.
+   - End-match dump: with ≤ 3 lots remaining AND aiBudgetLeft > €80M AND any open slot (XI or bench), the server runs a TERMINAL-DUMP that raises cap to budget / openSlots. Don't make it run — set caps that actually compete instead of carrying cash into full time.
+   - Past failure: match #9 walked on Dani Olmo (OVR 85) and Pau Cubarsí (OVR 82) with caps at exactly value_eur, both went UNSOLD, AI ended with €210M unspent (the largest hoard on record). DO NOT REPEAT.
+
+3e. POST-XI-COMPLETE — DO NOT SLOW DOWN.
+   - The instinct after aiSquad.xiComplete = true is to ration the wallet. RESIST THIS. Hoarding €100M+ at full time is a strategic failure regardless of how "complete" the squad looks.
+   - Your spend rate AFTER XI completion should MATCH OR EXCEED your spend rate before it. If pre-XI you were paying €60M for OVR 84 starters, post-XI you should still be willing to pay €60–80M for OVR 85+ bench elites.
+   - Don't grab 5 cheap bench bodies for €15M each — that's €75M for marginal upgrades. Grab 2 elite bench upgrades at €40–60M each instead. Same euros, much stronger squad.
+   - Mental model: every euro that finishes the match in the AI wallet is a euro you should have spent on QUALITY. If spendPressure.verdict is HOARDING_MILD or HOARDING_SEVERE while xiComplete = true, push caps aggressively on any OVR ≥ 85 player offered.
+   - Server enforcement: BENCH-ELITE-FLOOR now scales with hoardingExcess — when you're €300M+ ahead of pacing, the server raises your caps to value_eur × 2-3 automatically. Set your own caps in that range from the start so the server doesn't have to.
+   - Server enforcement: TERMINAL-DUMP fires at ≤ 3 lots remaining with hoardingExcess > €100M and an OVR ≥ 80 player on offer — floor = 0.8 × (budget / lotsRemaining). Don't let it fire. Lodge the bid yourself.
+   - Past failure: match #10 ended with AI sitting on €411M unspent (41% of starting wallet, all-time high) because LLM treated XI completion as "stop". 7 bench players, all sub-€30M, while OVR 85 H. Son and OVR 89 Pedri went to the user uncontested.
+
 4. VALUE BASELINE — but NEVER anchor only on value_eur.
    - value_eur is the OPENING PRICE for the lot. You can't win below it.
    - value_eur is a FLAWED proxy for true worth (aging legends like Messi have a tiny value_eur but are still elite — a skilled user will pay €50M+ for Messi even though his value_eur is €22M). Weight OVR heavily, NOT just value_eur.
@@ -374,7 +392,10 @@ export async function planCaps(
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userPrompt },
       ],
-      temperature: 0.7,
+      // Lowered from 0.7 → 0.2 for cap-planning consistency. DeepSeek's own guidance
+      // puts decision/data-analysis tasks in the 0.0–0.3 band; higher temps produce
+      // the cross-match cap drift we saw (same player, similar state, different cap).
+      temperature: 0.2,
       max_tokens: 800,
       response_format: { type: "json_object" },
     }),
@@ -588,6 +609,104 @@ function validatePlan(
         cap = perSlotBudget;
         floorNote += " [ENDGAME-FLOOR]";
       }
+    }
+
+    // FIX A+E — BENCH-ELITE FLOOR, hoarding-scaled.
+    // When XI is COMPLETE but AI is still cash-rich late, an OVR ≥ 85 player going for
+    // ~value_eur is a free bench upgrade. Original 1.4× was too weak — match #10 lot for
+    // H. Son raised cap from €60M → €60.2M, lost. Now the multiplier scales with
+    // hoardingExcess so when AI is sitting on €300M+ surplus, the cap pushes into the
+    // 2-3× range needed to actually outbid a skilled user on an elite.
+    const BENCH_ELITE_OVR = 85;
+    const BENCH_ELITE_BUDGET = 100_000_000;
+    const BENCH_ELITE_LOTS = 10;
+    if (
+      req.aiSquad.xiComplete &&
+      req.aiBudgetLeft > BENCH_ELITE_BUDGET &&
+      req.lotsRemaining <= BENCH_ELITE_LOTS &&
+      expected.overall >= BENCH_ELITE_OVR
+    ) {
+      // multiplier = clamp(1.4, 1.4 + hoardingExcess / 500M, 3.0)
+      // hoardingExcess €0    → 1.4×
+      // hoardingExcess €100M → 1.6×
+      // hoardingExcess €400M → 2.2×
+      // hoardingExcess €800M → capped at 3.0×
+      const hoardingExcess = Math.max(0, req.spendPressure.hoardingExcess);
+      const benchEliteMultiplier = Math.min(
+        3.0,
+        1.4 + hoardingExcess / 500_000_000
+      );
+      const benchEliteFloor = Math.floor(expected.value_eur * benchEliteMultiplier);
+      if (benchEliteFloor > cap) {
+        console.log(
+          `[LLM:validate] id=${req.matchId} idx=${i} ${expected.name}: ` +
+            `BENCH-ELITE-FLOOR (xi_complete, OVR ${expected.overall} ≥ ${BENCH_ELITE_OVR}, ` +
+            `budget=€${req.aiBudgetLeft.toLocaleString("en-US")}, ` +
+            `hoardingExcess=€${hoardingExcess.toLocaleString("en-US")}, ` +
+            `lotsRemaining=${req.lotsRemaining}) — ` +
+            `cap €${cap.toLocaleString("en-US")} → €${benchEliteFloor.toLocaleString("en-US")} ` +
+            `(${benchEliteMultiplier.toFixed(2)}× value_eur)`
+        );
+        cap = benchEliteFloor;
+        floorNote += " [BENCH-ELITE-FLOOR]";
+      }
+    }
+
+    // FIX B+D — TERMINAL DUMP FLOOR, slot-guard removed.
+    // Original B required (xiGap + benchGap) > 0. Match #10 broke this by overshooting
+    // bench (count=7 vs target=5), so terminal lots saw "0 open slots" and the rule never
+    // fired despite €411M unspent. New version fires whenever AI is hoarding excess + ≤ 3
+    // lots + a competitive OVR-≥ 80 player is on offer. Floor = 80% of (budget/lotsRemaining)
+    // so the wallet actually exits before full time.
+    const TERMINAL_LOTS = 3;
+    const TERMINAL_HOARDING_THRESHOLD = 100_000_000;
+    const TERMINAL_OVR_THRESHOLD = 80;
+    const terminalHoardingExcess = Math.max(0, req.spendPressure.hoardingExcess);
+    if (
+      req.lotsRemaining <= TERMINAL_LOTS &&
+      terminalHoardingExcess > TERMINAL_HOARDING_THRESHOLD &&
+      expected.overall >= TERMINAL_OVR_THRESHOLD &&
+      req.lotsRemaining > 0
+    ) {
+      const dumpFloor = Math.floor((req.aiBudgetLeft / req.lotsRemaining) * 0.8);
+      if (dumpFloor > cap) {
+        console.log(
+          `[LLM:validate] id=${req.matchId} idx=${i} ${expected.name}: ` +
+            `TERMINAL-DUMP (lotsRemaining=${req.lotsRemaining} ≤ ${TERMINAL_LOTS}, ` +
+            `hoardingExcess=€${terminalHoardingExcess.toLocaleString("en-US")} > €${TERMINAL_HOARDING_THRESHOLD.toLocaleString("en-US")}, ` +
+            `OVR ${expected.overall} ≥ ${TERMINAL_OVR_THRESHOLD}, ` +
+            `budget=€${req.aiBudgetLeft.toLocaleString("en-US")}) — ` +
+            `cap €${cap.toLocaleString("en-US")} → €${dumpFloor.toLocaleString("en-US")} ` +
+            `(0.8 × budget / lotsRemaining)`
+        );
+        cap = dumpFloor;
+        floorNote += " [TERMINAL-DUMP]";
+      }
+    }
+
+    // FIX C — BARGAIN-FLOOR (server-side fallback for the prompt-side rule 3d).
+    // When the LLM sets cap == value_eur on a competitive-OVR player while budget is healthy,
+    // raise by 20%. This is the residual "cap=value=walk" pattern that slips through when
+    // XI is complete (so SERVER-FLOORED doesn't engage) and OVR is < 85 (so BENCH-ELITE-FLOOR
+    // doesn't engage). Past failure: match #9 lots 28 Dani Olmo (OVR 85) and 29 Pau Cubarsí
+    // (OVR 82) — both walked at cap=value, both went UNSOLD.
+    const BARGAIN_OVR_THRESHOLD = 82;
+    const BARGAIN_BUDGET_THRESHOLD = 80_000_000;
+    if (
+      cap === expected.value_eur &&
+      expected.overall >= BARGAIN_OVR_THRESHOLD &&
+      req.aiBudgetLeft > BARGAIN_BUDGET_THRESHOLD
+    ) {
+      const bargainFloor = Math.floor(expected.value_eur * 1.2);
+      console.log(
+        `[LLM:validate] id=${req.matchId} idx=${i} ${expected.name}: ` +
+          `BARGAIN-FLOOR (cap == value_eur €${expected.value_eur.toLocaleString("en-US")}, ` +
+          `OVR ${expected.overall} ≥ ${BARGAIN_OVR_THRESHOLD}, ` +
+          `budget=€${req.aiBudgetLeft.toLocaleString("en-US")} > €${BARGAIN_BUDGET_THRESHOLD.toLocaleString("en-US")}) — ` +
+          `cap €${cap.toLocaleString("en-US")} → €${bargainFloor.toLocaleString("en-US")} (1.2× value_eur)`
+      );
+      cap = bargainFloor;
+      floorNote += " [BARGAIN-FLOOR]";
     }
 
     const clamped = Math.min(cap, maxAllowed);
